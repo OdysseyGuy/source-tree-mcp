@@ -1,0 +1,12 @@
+[project]
+name = "source-tree-mcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "black>=26.5.1",
+    "fastmcp>=3.4.2",
+    "gitpython>=3.1.50",
+    "mcp[cli]>=1.27.2",
+]
