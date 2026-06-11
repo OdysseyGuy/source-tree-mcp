@@ -14,16 +14,17 @@ import git
 import re
 import subprocess
 from dataclasses import dataclass
+import tempfile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==========================================================
+# ----------------------------------------------------------
 # SYSTEM PARAMETERS
-# ==========================================================
+# ----------------------------------------------------------
 
-ALLOWED_ROOT_DIR = Path(r"path\to\project").resolve()
+ALLOWED_ROOT_DIR = Path(r"path/to/project").resolve()
 
 ALLOWED_EXTENSIONS = {
     ".cpp",
@@ -67,6 +68,14 @@ MAX_CHARS_PER_RESPONSE = (
     60000  # Generous cap (~15k tokens) - easily covers a few thousand lines of code
 )
 
+SANDBOX_BRANCH = "mcp-sandbox"
+
+CPP_EXTENSIONS = {".c", ".cpp", ".cxx", ".cc", ".h", ".hpp", ".hxx", ".inl", ".ixx"}
+
+
+def _is_cpp_file(path: str) -> bool:
+    return Path(path).suffix.lower() in CPP_EXTENSIONS
+
 
 # Used to build the dependency graph in the build dependencies
 @dataclass
@@ -84,15 +93,21 @@ class IncludeInfo:
     include_type: str  # SYSTEM | PROJECT | UNRESOLVED
 
 
+@dataclass
+class GitWorkspace:
+    repo: git.Repo
+    sandbox_branch: str
+
+
 server_instructions = """
 Search and inspect source code files inside the restricted workspace.
 Files are returned in full single-pass outputs. If a file is exceptionally large, 
 the server will automatically truncate the tail end and append an explicit notice.
 """
 
-# ==========================================================
+# ----------------------------------------------------------
 # FILE SYSTEM SECURITY & ACCESS HELPERS
-# ==========================================================
+# ----------------------------------------------------------
 
 
 def secure_path(relative_path: str) -> Path:
@@ -119,9 +134,9 @@ def enforce_truncation_safety(text_data: str) -> str:
     return text_data
 
 
-# ==========================================================
+# ----------------------------------------------------------
 # COMPILE COMMANDS DATABASE
-# ==========================================================
+# ----------------------------------------------------------
 
 # Resolved at import time. Maps absolute resolved path -> compile_commands entry dict.
 # O(1) lookup per file; entries look like:
@@ -321,6 +336,11 @@ def sanitize_compile_command(command: List[str]) -> List[str]:
 
 # Load the database immediately when the module is imported.
 _load_compile_commands()
+
+
+# ----------------------------------------------------------
+# HEADER INCLUDES AND DEPENDENCY RESOLVER
+# ----------------------------------------------------------
 
 
 _INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^">]+)[">]')
@@ -643,14 +663,52 @@ def format_dependency_tree(
     return lines
 
 
-def create_server():
-    mcp = FastMCP(name="Local Source Tree Explorer", instructions=server_instructions)
+# ----------------------------------------------------------
+# GIT SANDBOXING
+# ----------------------------------------------------------
 
+
+def initialize_git_workspace() -> GitWorkspace | None:
     try:
         repo = git.Repo(ALLOWED_ROOT_DIR)
-        logger.info(f"Git tracking module initialized at: {ALLOWED_ROOT_DIR}")
+        branch_names = {branch.name for branch in repo.branches}
+
+        current_branch = repo.active_branch.name
+        logger.info(f"Current branch before MCP startup: {current_branch}")
+
+        #
+        # Create sandbox branch if missing.
+        #
+        if SANDBOX_BRANCH not in branch_names:
+            logger.info(f"Creating sandbox branch '{SANDBOX_BRANCH}'")
+            repo.git.checkout("-b", SANDBOX_BRANCH)
+
+        #
+        # Otherwise switch to it.
+        #
+        else:
+            logger.info(f"Switching to sandbox branch '{SANDBOX_BRANCH}'")
+            repo.git.checkout(SANDBOX_BRANCH)
+
+        logger.info(
+            f"MCP workspace initialized on branch: " f"{repo.active_branch.name}"
+        )
+
+        return GitWorkspace(repo=repo, sandbox_branch=SANDBOX_BRANCH)
+
     except git.InvalidGitRepositoryError:
-        repo = None
+        logger.warning("Workspace is not a git repository.")
+        return None
+
+    except Exception as exc:
+        logger.error(f"Failed to initialize sandbox: {exc}")
+        return None
+
+
+def create_server():
+    # Setup sandbox git branch
+    workspace = initialize_git_workspace()
+    repo = workspace.repo if workspace else None
 
     def _blocking_git_ls(target_dir: Path) -> List[str]:
         if not repo:
@@ -665,9 +723,29 @@ def create_server():
         tracked_files = repo.git.ls_files(relative_target).splitlines()
         return [f_str for f_str in tracked_files if not f_str.startswith(".")]
 
-    # --- SIMPLIFIED ONE-PASS TOOLS ---
+    # Setup MCP Server
+    mcp = FastMCP(name="Local Source Tree Explorer", instructions=server_instructions)
 
-    @mcp.tool()
+    # MCP Tools
+
+    @mcp.tool(annotations={"destructiveHint": False})
+    async def workspace_status() -> str:
+        """
+        Returns git workspace information.
+        """
+        if not repo:
+            return "Git repository unavailable."
+
+        def _status():
+            status = repo.git.status("--short")
+            return (
+                f"Branch: {repo.active_branch.name}\n\n"
+                f"{status or 'Workspace Clean'}"
+            )
+
+        return await asyncio.to_thread(_status)
+
+    @mcp.tool(annotations={"destructiveHint": False})
     async def list_directory(relative_path: str = "") -> str:
         """Recursively lists all files tracked in the repository workspace."""
         try:
@@ -682,7 +760,7 @@ def create_server():
         except Exception as e:
             return f"Scan failed: {str(e)}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def read_entire_file(relative_path: str) -> str:
         """
         Reads the requested source file completely into the context window.
@@ -714,7 +792,7 @@ def create_server():
         except Exception as e:
             return f"File transmission error: {str(e)}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def search_text(query: str, relative_path: str = "") -> str:
         try:
             import json as _json
@@ -771,7 +849,7 @@ def create_server():
         except Exception as e:
             return f"Grep analysis error: {e}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def search_text_ripgrep(query: str, relative_path: str = "") -> str:
         """
         Ultra-fast substring or regex grepping across repository files using Ripgrep (rg).
@@ -853,7 +931,7 @@ def create_server():
         except Exception as e:
             return f"Search execution halted: {str(e)}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def get_outline(relative_path: str) -> str:
         """
         Generates a semantic outline using Clang AST.
@@ -947,7 +1025,7 @@ def create_server():
         except Exception as e:
             return f"Outline compilation failed: {e}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def find_definition(symbol: str) -> str:
         """
         Attempts to locate the definition of a function, method,
@@ -1031,7 +1109,7 @@ def create_server():
         except Exception as e:
             return f"Definition lookup failed: {e}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def find_callers(symbol: str) -> str:
         """
         Finds call sites of a function or method.
@@ -1088,7 +1166,7 @@ def create_server():
         except Exception as e:
             return f"Caller lookup failed: {e}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def find_includes(relative_path: str) -> str:
         """
         Lists all #includes and resolves them
@@ -1124,7 +1202,7 @@ def create_server():
         except Exception as exc:
             return f"Failed: {exc}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def find_implementations(class_name: str) -> str:
         """
         Finds method implementations belonging
@@ -1189,7 +1267,7 @@ def create_server():
         except Exception as e:
             return f"Implementation lookup failed: {e}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def get_git_diff(cached: bool = False) -> str:
         """
         Returns the active structural modifications in the repository (staged or unstaged).
@@ -1216,7 +1294,7 @@ def create_server():
         except Exception as e:
             return f"Diff generation aborted: {str(e)}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def read_file_surround(
         relative_path: str, target_line: int, radius: int = 35
     ) -> str:
@@ -1254,7 +1332,7 @@ def create_server():
         except Exception as e:
             return f"Targeted window read failed: {str(e)}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def cpp_lint_file(relative_path: str) -> str:
         """
         Runs a dry-run syntax and semantic check on a targeted C/C++ file using MSVC CL/Clang.
@@ -1298,19 +1376,38 @@ def create_server():
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await process.communicate()
-            raw_errors = stderr.decode("utf-8", errors="replace")
+            stdout, stderr = await process.communicate()
 
-            if not raw_errors.strip():
-                return "✅ [SUCCESS: Syntax and semantic analysis passed with 0 errors/warnings.]"
+            raw_stdout = stdout.decode("utf-8", errors="replace")
+            raw_stderr = stderr.decode("utf-8", errors="replace")
 
-            return enforce_truncation_safety(raw_errors)
+            if process.returncode != 0:
+                return enforce_truncation_safety(
+                    raw_stderr if raw_stderr.strip() else raw_stdout
+                )
+
+            if process.returncode == 0:
+                return "SUCCESS: Syntax and semantic analysis passed with 0 errors/warnings."
+
+            combined = ""
+            if raw_stdout.strip():
+                combined += raw_stdout
+
+            if raw_stderr.strip():
+                if combined:
+                    combined += "\n"
+                combined += raw_stderr
+
+            if not combined.strip():
+                return "SUCCESS: Syntax and semantic analysis passed with 0 errors/warnings."
+
+            return enforce_truncation_safety(combined)
         except FileNotFoundError:
             return "Error: 'clang' executable not found on your System PATH. Please verify installation variables."
         except Exception as e:
             return f"Clang linting aborted: {str(e)}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def clang_dump_ast(relative_path: str, filter_symbol: str = "") -> str:
         """
         Dumps the Clang Abstract Syntax Tree (AST) of a source file in JSON format.
@@ -1391,7 +1488,7 @@ def create_server():
         except Exception as e:
             return f"AST compilation pass aborted: {str(e)}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def clang_expand_preprocessor(relative_path: str) -> str:
         """
         Runs Clang's preprocessor pass (-E) to expand all macros, includes, and
@@ -1438,7 +1535,7 @@ def create_server():
         except Exception as e:
             return f"Preprocessor pipeline error: {str(e)}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def get_file_dependencies(relative_path: str, max_depth: int = 5) -> str:
         """
         Builds a recursive header dependency tree.
@@ -1471,7 +1568,7 @@ def create_server():
         except Exception as exc:
             return f"Failed to build dependency graph: {exc}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def get_git_log(max_commits: int = 10, relative_path: str = "") -> str:
         """
         Retrieves the repository commit log history. Pass a relative file path
@@ -1503,7 +1600,7 @@ def create_server():
         except Exception as e:
             return f"Telemetry fetch failed: {str(e)}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def find_symbol_references(symbol_name: str) -> str:
         """
         Scans the workspace and lists only the filenames that contain references to the given symbol.
@@ -1565,7 +1662,7 @@ def create_server():
         except Exception as e:
             return f"Symbol locator failed: {str(e)}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def get_directory_tree(relative_path: str = "", depth: int = 3) -> str:
         """
         Generates a visual directory tree structure up to a specified depth.
@@ -1633,7 +1730,7 @@ def create_server():
         except Exception as e:
             return f"Tree compilation failed: {str(e)}"
 
-    @mcp.tool()
+    @mcp.tool(annotations={"destructiveHint": False})
     async def search_text_multi_pattern(
         patterns: list[str], relative_path: str = ""
     ) -> str:
@@ -1724,6 +1821,261 @@ def create_server():
             return "Error: 'rg' executable not found on " "your System PATH."
         except Exception as e:
             return f"Multi-search execution aborted: {e}"
+
+    @mcp.tool(annotations={"destructiveHint": False})
+    async def apply_patch(unified_diff: str) -> str:
+        """
+        Applies a unified git patch.
+        """
+        if not repo:
+            return "Error: This workspace root is not initialized as a git repository repository workspace."
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".patch", delete=False, mode="w", encoding="utf-8"
+            ) as f:
+                f.write(unified_diff)
+                patch_path = f.name
+
+            def _apply():
+                repo.git.apply(
+                    "--verbose",
+                    "--ignore-whitespace",
+                    "--whitespace=nowarn",
+                    patch_path,
+                )
+
+            # apply the git patch
+            await asyncio.to_thread(_apply)
+            return "Patch applied successfully."
+
+        except Exception as exc:
+            return f"Patch apply failed:\n{exc}"
+        # clean up patch files afterwards
+        finally:
+            try:
+                os.remove(patch_path)
+            except:
+                pass
+
+    @mcp.tool(annotations={"destructiveHint": False})
+    async def apply_patch_and_validate(
+        unified_diff: str, files_to_validate: list[str]
+    ) -> str:
+        """
+        Applies a unified git patch and validates if the patched files compiles without any errors.
+        """
+        apply_result = await apply_patch(unified_diff)
+        if "failed" in apply_result.lower():
+            return apply_result
+
+        # try compiling each file and check if the patch is compiling
+        diagnostics = []
+        for file in files_to_validate:
+            if not _is_cpp_file(file):
+                diagnostics.append(
+                    {
+                        "file": file,
+                        "status": "skipped",
+                        "reason": "Not a C/C++ source file",
+                    }
+                )
+                continue
+
+            try:
+                result = await cpp_lint_file(file)
+                diagnostics.append({"file": file, "diagnostics": result})
+            except Exception as exc:
+                diagnostics.append(
+                    {"file": file, "status": "failed", "reason": str(exc)}
+                )
+        return json.dumps({"success": True, "validation": diagnostics}, indent=2)
+
+    @mcp.tool(annotations={"destructiveHint": False})
+    async def replace_text(
+        relative_path: str, old_text: str, new_text: str, replace_all: bool = False
+    ) -> str:
+        """
+        Replaces text inside a source file.
+
+        By default exactly one occurrence must exist.
+        This prevents accidental modifications.
+
+        Set replace_all=True to replace every occurrence.
+        """
+        try:
+            target = secure_path(relative_path)
+            if not target.is_file() or not is_allowed_file(target):
+                return "Error: Invalid source file."
+
+            def _replace():
+                with open(
+                    target,
+                    "r",
+                    encoding="utf-8",
+                    errors="replace",
+                ) as f:
+                    contents = f.read()
+
+                occurrence_count = contents.count(old_text)
+                if occurrence_count == 0:
+                    return "Error: Search text not found.\n" f"File: {relative_path}"
+
+                if not replace_all and occurrence_count > 1:
+                    return (
+                        "Error: Search text is ambiguous.\n"
+                        f"Found {occurrence_count} occurrences.\n"
+                        "Use replace_all=True or provide a more specific anchor."
+                    )
+
+                if replace_all:
+                    updated = contents.replace(old_text, new_text)
+                    replacements = occurrence_count
+                else:
+                    updated = contents.replace(old_text, new_text, 1)
+                    replacements = 1
+
+                with open(
+                    target,
+                    "w",
+                    encoding="utf-8",
+                    newline="",
+                ) as f:
+                    f.write(updated)
+                return (
+                    f"Success: Replaced {replacements} "
+                    f"occurrence(s) in '{relative_path}'."
+                )
+
+            return await asyncio.to_thread(_replace)
+        except Exception as exc:
+            return f"Replace failed: {exc}"
+
+    @mcp.tool(annotations={"destructiveHint": False})
+    async def insert_after_text(
+        relative_path: str,
+        anchor_text: str,
+        text_to_insert: str,
+        occurrence: int = 1,
+    ) -> str:
+        """
+        Inserts text immediately after a matching anchor string.
+
+        Example
+            insert_after_text(
+                "foo.cpp",
+                "void Foo()",
+                "\n// Inserted text\n"
+            )
+
+        Rules:
+            - Anchor must exist.
+            - occurrence is 1-based.
+            - Fails if the requested occurrence does not exist.
+        """
+        try:
+            target = secure_path(relative_path)
+            if not target.is_file() or not is_allowed_file(target):
+                return "Error: Invalid source file."
+
+            if not anchor_text:
+                return "Error: Anchor text cannot be empty."
+
+            if occurrence < 1:
+                return "Error: occurrence must be >= 1."
+
+            def _insert() -> str:
+                with open(
+                    target,
+                    "r",
+                    encoding="utf-8",
+                    errors="replace",
+                ) as f:
+                    contents = f.read()
+
+                occurrence_count = contents.count(anchor_text)
+                if occurrence_count == 0:
+                    return "Error: Anchor text not found.\n" f"File: {relative_path}"
+
+                if occurrence > occurrence_count:
+                    return (
+                        f"Error: Requested occurrence {occurrence}, "
+                        f"but only {occurrence_count} occurrence(s) exist."
+                    )
+
+                search_start = 0
+                anchor_index = -1
+
+                for _ in range(occurrence):
+                    anchor_index = contents.find(anchor_text, search_start)
+                    if anchor_index == -1:
+                        return (
+                            "Error: Internal search failure while "
+                            "locating anchor occurrence."
+                        )
+
+                    search_start = anchor_index + len(anchor_text)
+                insert_position = anchor_index + len(anchor_text)
+
+                updated_contents = (
+                    contents[:insert_position]
+                    + text_to_insert
+                    + contents[insert_position:]
+                )
+
+                with open(
+                    target,
+                    "w",
+                    encoding="utf-8",
+                    newline="",
+                ) as f:
+                    f.write(updated_contents)
+
+                return (
+                    f"Success: Inserted text after occurrence "
+                    f"{occurrence} of anchor in '{relative_path}'."
+                )
+
+            return await asyncio.to_thread(_insert)
+
+        except Exception as exc:
+            return f"Insert failed: {exc}"
+
+    @mcp.tool(annotations={"destructiveHint": False})
+    async def validate_files(files: list[str]) -> str:
+        """
+        Runs compilation/syntax validation on a set of files.
+        """
+        diagnostics = []
+        for file in files:
+            if not _is_cpp_file(file):
+                diagnostics.append(
+                    {
+                        "file": file,
+                        "status": "skipped",
+                        "reason": "Not a C/C++ source file",
+                    }
+                )
+                continue
+
+            try:
+                result = await cpp_lint_file(file)
+                diagnostics.append(
+                    {
+                        "file": file,
+                        "success": result.startswith("SUCCESS"),
+                        "diagnostics": result,
+                    }
+                )
+            except Exception as exc:
+                diagnostics.append(
+                    {"file": file, "success": False, "diagnostics": str(exc)}
+                )
+
+        return json.dumps(
+            {"success": True, "validation": diagnostics},
+            indent=2,
+        )
 
     return mcp
 

@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Might get generated due to compilations
+*.pdb
